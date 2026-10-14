@@ -12,6 +12,7 @@ Chi stdlib (http.server + http.client). Chay:
 """
 import argparse
 import datetime
+import gzip
 import http.client
 import json
 import os
@@ -168,6 +169,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             else:
                 data = resp.read()
+                # Giai nen neu upstream tra gzip/deflate (client cu khong gui
+                # Accept-Encoding nhu curl/postman mac dinh van nhan gzip).
+                enc = (resp.getheader("Content-Encoding") or "").lower()
+                if data and enc == "gzip":
+                    try:
+                        data = gzip.decompress(data)
+                    except Exception:
+                        pass
+                elif data and enc == "deflate":
+                    try:
+                        import zlib
+                        data = zlib.decompress(data)
+                    except Exception:
+                        pass
                 self.send_response(resp.status, resp.reason)
                 for k, v in resp.getheaders():
                     if k.lower() not in ("content-length", "transfer-encoding",
