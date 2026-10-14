@@ -1,24 +1,40 @@
 #!/usr/bin/env python3
-"""detem-shim — forward sang 9router, tu chen "stream": false khi client khong gui.
+"""detem-shim — proxy thang vao tokenize.vn, khong qua 9router.
 
-Client (mozhenzhen...) -> 127.0.0.1:20131 (shim nay) -> 127.0.0.1:20127 (9router).
-Provider detem (tokenize.vn) tra rong/cut neu body thieu stream -> shim chen
-stream=false truoc khi forward. Client gui stream=true giu nguyen (SSE relay).
+Client (mozhenzhen...) -> shim nay -> https://tokenize.vn/v1
+- Tu giu DETEM_API_KEY phia server (env DETEM_API_KEY), client khong can key that.
+- Body thieu "stream" -> tu chen stream=false (detem tra rong neu thieu).
+- Model "dt/deepseek-v4.1-flash" -> strip ve tran truoc khi forward.
+- GET /v1/models -> chi hien 2 model detem ten tran.
 
 Chi stdlib (http.server + http.client). Chay:
-  python3 /poki/tools/detem-shim/shim.py [--host 127.0.0.1] [--port 20131] [--upstream http://127.0.0.1:20127]
+  DETEM_API_KEY=tk-... python3 shim.py [--host 0.0.0.0] [--port 20131] [--upstream https://tokenize.vn/v1]
 """
 import argparse
 import datetime
 import http.client
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-UPSTREAM = "http://127.0.0.1:20127"
+UPSTREAM = "https://tokenize.vn/v1"
+DETEM_API_KEY = os.environ.get("DETEM_API_KEY", "")
+# Model detem ho tro (ten tran nhu goi direct)
+DT_MODELS = ("deepseek-v4.1-flash", "deepseek-v4-pro")
+DT_PREFIX = "dt/"
 FORWARD_TIMEOUT = 120
 HOP_HEADERS = {"host", "connection", "keep-alive", "transfer-encoding",
-               "upgrade", "proxy-authenticate", "proxy-authorization", "te", "trailer"}
+               "upgrade", "proxy-authenticate", "proxy-authorization", "te", "trailer",
+               "authorization", "content-length"}
+
+
+def upstream_conn(up):
+    if up.scheme == "https":
+        return http.client.HTTPSConnection(up.hostname, up.port or 443,
+                                           timeout=FORWARD_TIMEOUT)
+    return http.client.HTTPConnection(up.hostname, up.port or 80,
+                                      timeout=FORWARD_TIMEOUT)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -30,7 +46,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log(self, path, model, patched):
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        print(f"{ts} path={path} model={model} stream_patched={str(patched).lower()}",
+        print(f"{ts} path={path} model={model} patched={str(patched).lower()}",
               flush=True)
 
     def _send_json(self, status, obj):
@@ -46,6 +62,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_json(200, {"ok": True})
             return
+        if path == "/v1/models":
+            self._models()
+            return
         self._forward(None)
 
     def do_POST(self):
@@ -56,6 +75,39 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_POST
     do_PATCH = do_POST
     do_DELETE = do_GET
+
+    def _models(self):
+        # Forward len tokenize, loc chi giu model detem ten tran.
+        # Tokenize hong /models -> tra static.
+        up = urlsplit(UPSTREAM)
+        data = None
+        try:
+            conn = upstream_conn(up)
+            conn.request("GET", "/v1/models",
+                         headers={"Authorization": "Bearer " + DETEM_API_KEY})
+            resp = conn.getresponse()
+            if resp.status == 200:
+                data = resp.read()
+            conn.close()
+        except Exception:
+            data = None
+        items = []
+        if data:
+            try:
+                payload = json.loads(data.decode("utf-8"))
+                for m in payload.get("data") or []:
+                    mid = m.get("id", "")
+                    if mid in DT_MODELS:
+                        items.append({"id": mid, "object": "model",
+                                      "created": m.get("created", 0),
+                                      "owned_by": "detem"})
+            except Exception:
+                items = []
+        if not items:
+            items = [{"id": m, "object": "model", "created": 0,
+                      "owned_by": "detem"} for m in DT_MODELS]
+        self.log("/v1/models", "-", False)
+        self._send_json(200, {"object": "list", "data": items})
 
     def _forward(self, raw):
         up = urlsplit(UPSTREAM)
@@ -72,26 +124,27 @@ class Handler(BaseHTTPRequestHandler):
                 body = None
             if isinstance(body, dict):
                 model = body.get("model") or "-"
-                # Client khong gui stream (None) -> detem tra rong -> chen false.
-                # stream=true giu nguyen de SSE relay.
+                # Strip prefix dt/ -> ten tran nhu goi direct.
+                if isinstance(model, str) and model.startswith(DT_PREFIX):
+                    body["model"] = model[len(DT_PREFIX):]
+                    model = body["model"]
+                    patched = True
+                # Thieu stream -> chen false (detem tra rong neu thieu).
                 if body.get("stream") is None:
                     body["stream"] = False
                     patched = True
-                    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 stream = body.get("stream") is True
         self.log(path, model, patched)
 
         fwd_headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in HOP_HEADERS}
-        if is_chat:
-            # Strip encoding/length cu (body co the doi sau patch), de phia
-            # duoi tu thuong luong lai — tranh double-gzip/size lech.
-            fwd_headers = {k: v for k, v in fwd_headers.items()
-                           if k.lower() not in ("accept-encoding", "content-encoding",
-                                                "content-length", "transfer-encoding")}
+        # Key that nam server, client khong can biet.
+        fwd_headers["Authorization"] = "Bearer " + DETEM_API_KEY
+        fwd_headers["Content-Type"] = "application/json"
         try:
-            conn = http.client.HTTPConnection(up.hostname, up.port or 80,
-                                              timeout=FORWARD_TIMEOUT)
+            conn = upstream_conn(up)
+            # Map path ve upstream: /v1/... giu nguyen (tokenize goc /v1).
             conn.request(self.command, path_qs, body=raw, headers=fwd_headers)
             resp = conn.getresponse()
             if stream and is_chat:
@@ -139,13 +192,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global UPSTREAM
+    global UPSTREAM, DETEM_API_KEY
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=20131)
-    ap.add_argument("--upstream", default="http://127.0.0.1:20127")
+    ap.add_argument("--upstream", default="https://tokenize.vn/v1")
+    ap.add_argument("--api-key", default=None)
     args = ap.parse_args()
     UPSTREAM = args.upstream.rstrip("/")
+    if args.api_key:
+        DETEM_API_KEY = args.api_key
+    if not DETEM_API_KEY:
+        print("FATAL: thieu DETEM_API_KEY (env hoac --api-key)", flush=True)
+        raise SystemExit(2)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"[detem-shim] listening {args.host}:{args.port} -> {UPSTREAM}", flush=True)

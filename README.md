@@ -1,33 +1,39 @@
-# detem-shim — Forward sang 9router, tự chèn `"stream": false`
+# detem-shim — Proxy thẳng vào tokenize.vn (không qua 9router)
 
-Provider detem (tokenize.vn) qua 9router trả rỗng/cụt nếu body thiếu `stream`.
-Shim này đứng giữa: client không cần gửi `stream`, shim tự chèn `stream: false`
-trước khi forward. Client gửi `stream: true` được giữ nguyên (SSE relay).
+Client → shim này → `https://tokenize.vn/v1`. Key detem giữ phía server
+(env `DETEM_API_KEY`), client gọi không cần key.
+
+Tự xử 2 việc:
+- Body thiếu `"stream"` → tự chèn `stream: false` (detem trả rỗng nếu thiếu).
+- Model `"dt/deepseek-v4.1-flash"` → strip về tên trần trước khi forward.
 
 Chỉ dùng Python stdlib, không dependency.
 
 ## Chạy
 
 ```bash
-python3 shim.py [--host 127.0.0.1] [--port 20131] [--upstream http://127.0.0.1:20127]
+DETEM_API_KEY=tk-... python3 shim.py [--host 0.0.0.0] [--port 20131] [--upstream https://tokenize.vn/v1]
 ```
 
-## API (OpenAI-compatible, base `http://HOST:20131`)
+Thiếu key là exit 2 ngay lúc khởi động.
+
+## API (base `http://HOST:20131`, không cần Authorization)
 
 - `GET /health` → `{"ok": true}`
-- `GET /v1/models` → danh sách model của 9router (gồm `dt/deepseek-v4-pro`, `dt/deepseek-v4.1-flash`), cần header `Authorization: Bearer <key-9router>`
-- `POST /v1/chat/completions` → forward sang 9router, tự chèn `stream:false` nếu thiếu
-
-Ví dụ (không cần `stream`):
+- `GET /v1/models` → chỉ 2 model detem tên trần:
+  `deepseek-v4-pro`, `deepseek-v4.1-flash`
+- `POST /v1/chat/completions` → forward thẳng tokenize.vn:
 
 ```bash
 curl http://127.0.0.1:20131/v1/chat/completions \
-  -H "Authorization: Bearer <key>" -H 'Content-Type: application/json' \
-  -d '{"model":"dt/deepseek-v4.1-flash","max_tokens":64,
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4.1-flash","max_tokens":64,
        "messages":[{"role":"user","content":"hi"}]}'
 ```
 
+`stream: true` được giữ nguyên (SSE relay).
+
 ## Log
 
-Mỗi request chat 1 dòng: timestamp, path, model, `stream_patched=true/false`
-(cho biết có phải chèn `stream` không). Không log Authorization, không log prompt.
+Mỗi request 1 dòng: timestamp, path, model, `patched=true/false`
+(có chèn `stream`/strip prefix không). Không log key, không log prompt.
